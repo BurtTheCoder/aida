@@ -1,15 +1,14 @@
 # services/claude_service.py
-from anthropic import Anthropic
+from anthropic import Anthropic, APITimeoutError, RateLimitError
 import logging
+import asyncio
 from typing import Dict, Any, List, Optional
 from config.settings import settings
 from config.prompts import SYSTEM_PROMPT
 
 class ClaudeService:
-    """Service for handling Claude/Anthropic API interactions"""
-    
     def __init__(self):
-        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=30.0)  # Increased timeout
         self.tools = [{
             "name": "web_search",
             "description": """
@@ -46,152 +45,86 @@ class ClaudeService:
             }
         }]
 
-    async def process_message(
-        self, 
-        message: str, 
-        conversation_history: Optional[List[Dict[str, Any]]] = None,
-        temperature: float = 0.7
-    ) -> str:
-        """
-        Process a message using Claude with optional conversation history
-        """
-        try:
-            # Build messages list
-            messages = []
-            if conversation_history:
-                messages.extend(conversation_history)
-            messages.append({
-                "role": "user",
-                "content": message
-            })
+    async def _make_request_with_retry(self, func, *args, max_retries=3, **kwargs):
+        """Helper method to make requests with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(func, *args, **kwargs),
+                    timeout=30.0
+                )
+            except (APITimeoutError, RateLimitError) as e:
+                if attempt == max_retries - 1:
+                    raise
+                wait_time = (attempt + 1) * 2
+                logging.warning(f"Request failed (attempt {attempt + 1}/{max_retries}), waiting {wait_time}s: {str(e)}")
+                await asyncio.sleep(wait_time)
+            except Exception as e:
+                logging.error(f"Unexpected error in Claude request: {str(e)}")
+                raise
 
+    async def handle_message_with_tools(self, message: str, web_search_service: Any) -> str:
+        """Process user input using Claude with tool use capabilities"""
+        try:
             # Initial response from Claude
-            response = self.client.messages.create(
+            response = await self._make_request_with_retry(
+                self.client.messages.create,
                 model="claude-3-5-haiku-20241022",
                 max_tokens=4096,
-                temperature=temperature,
+                temperature=0.7,
                 tools=self.tools,
                 tool_choice={"type": "auto"},
-                messages=messages,
-                system=SYSTEM_PROMPT
-            )
-
-            return response.content[0].text, response
-
-        except Exception as e:
-            logging.error(f"Error in Claude service: {e}", exc_info=True)
-            return "I apologize, but I encountered an error processing your request.", None
-
-    async def process_tool_response(
-        self,
-        original_message: str,
-        first_response: Any,
-        tool_result: str,
-        tool_call_id: str
-    ) -> str:
-        """
-        Process tool response with Claude
-        """
-        try:
-            final_response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=4096,
-                tools=self.tools,
-                messages=[
-                    {"role": "user", "content": original_message},
-                    {"role": "assistant", "content": first_response.content},
-                    {
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_id,
-                            "content": str(tool_result)
-                        }]
-                    }
-                ],
-                system=SYSTEM_PROMPT
-            )
-            
-            return final_response.content[0].text
-
-        except Exception as e:
-            logging.error(f"Error processing tool response: {e}", exc_info=True)
-            return "I apologize, but I encountered an error processing the tool response."
-
-    async def handle_message_with_tools(
-        self, 
-        message: str,
-        web_search_service: Any
-    ) -> str:
-        """
-        Handle message processing with potential tool use
-        """
-        response_text, first_response = await self.process_message(message)
-        
-        # Check if tool use is requested
-        if first_response and first_response.stop_reason == "tool_use":
-            tool_calls = [content for content in first_response.content if content.type == 'tool_use']
-            
-            if tool_calls:
-                tool_call = tool_calls[0]  # Get the first tool call
-                
-                if tool_call.name == "web_search":
-                    search_query = tool_call.input["query"]
-                    logging.info(f"Web search query: {search_query}")
-                    
-                    # Execute web search
-                    tool_result = await web_search_service.search(search_query)
-                    logging.info(f"Web search result: {tool_result}")
-                    
-                    # Process with tool result
-                    response_text = await self.process_tool_response(
-                        message,
-                        first_response,
-                        tool_result,
-                        tool_call.id
-                    )
-
-        return response_text
-
-    async def get_conversation_context(
-        self,
-        conversation_history: List[Dict[str, Any]]
-    ) -> str:
-        """
-        Generate conversation context from history
-        """
-        try:
-            response = self.client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=1000,
                 messages=[{
                     "role": "user",
-                    "content": "Please analyze our conversation so far and provide a brief context of what we've been discussing."
-                }] + conversation_history,
+                    "content": message
+                }],
                 system=SYSTEM_PROMPT
             )
-            
+
+            # If Claude wants to use a tool
+            if response.stop_reason == "tool_use":
+                logging.info("Tool use requested")
+                tool_calls = [content for content in response.content if content.type == 'tool_use']
+
+                if tool_calls:
+                    tool_call = tool_calls[0]  # Get the first tool call
+                    logging.info(f"Tool Response Request: {tool_calls}")
+
+                    if tool_call.name == "web_search":
+                        search_query = tool_call.input["query"]
+                        logging.info(f"Web search query: {search_query}")
+                        tool_result = await web_search_service.search(search_query)
+                        logging.info(f"Web search result: {tool_result}")
+
+                        tool_result_content = {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_call.id,
+                                    "content": str(tool_result)
+                                }
+                            ]
+                        }
+
+                        # Send tool results back to Claude with proper format
+                        final_response = await self._make_request_with_retry(
+                            self.client.messages.create,
+                            model="claude-3-5-sonnet-20241022",
+                            max_tokens=4096,
+                            tools=self.tools,
+                            messages=[
+                                {"role": "user", "content": message},
+                                {"role": "assistant", "content": response.content},
+                                tool_result_content
+                            ],
+                            system=SYSTEM_PROMPT
+                        )
+                        return final_response.content[0].text
+
+            # Return direct response if no tool was used
             return response.content[0].text
 
         except Exception as e:
-            logging.error(f"Error getting conversation context: {e}")
-            return ""
-
-    def format_system_prompt(self, additional_instructions: Optional[str] = None) -> str:
-        """
-        Format system prompt with optional additional instructions
-        """
-        prompt = SYSTEM_PROMPT
-        if additional_instructions:
-            prompt += f"\n\nAdditional Instructions:\n{additional_instructions}"
-        return prompt
-
-    def validate_message(self, message: str) -> bool:
-        """
-        Validate message before sending to API
-        """
-        if not message or not message.strip():
-            return False
-        if len(message) > 4000:  # Arbitrary limit
-            logging.warning("Message exceeds recommended length")
-        return True
+            logging.error(f"Error processing input: {e}", exc_info=True)
+            return "I apologize, but I encountered an error processing your request. Please try again."

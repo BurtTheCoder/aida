@@ -1,6 +1,6 @@
 # main.py
 import asyncio
-import logging
+from utils import logging
 from pathlib import Path
 from config.settings import settings
 from utils.logging import setup_logging
@@ -28,6 +28,11 @@ def setup_args():
         action='store_true',
         help='Disable text-to-speech in text mode'
     )
+    parser.add_argument(
+        '--user-id',
+        default='default_user',
+        help='User ID for memory persistence'
+    )
     return parser.parse_args()
 
 async def main():
@@ -35,25 +40,25 @@ async def main():
     try:
         args = setup_args()
         setup_logging(debug=args.debug)
-        
+
         # Initialize assistant
-        assistant = AidaAssistant()
-        
+        assistant = AidaAssistant(user_id=args.user_id)
+
         try:
             if args.mode == 'text':
                 mode = TextMode(assistant, use_tts=not args.no_tts)
             else:
                 mode = VoiceMode(assistant)
-                
+
             await mode.run()
-            
+
         except KeyboardInterrupt:
             logging.info("Received keyboard interrupt, shutting down...")
         except Exception as e:
             logging.error(f"Unexpected error in main loop: {e}", exc_info=True)
         finally:
             await mode.cleanup()
-            
+
     except Exception as e:
         logging.error(f"Critical error during startup: {e}", exc_info=True)
         raise

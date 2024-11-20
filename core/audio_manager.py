@@ -12,29 +12,39 @@ class AudioManager:
         self.pa = pyaudio.PyAudio()
         self.stream: Optional[pyaudio.Stream] = None
         self.is_speaking = asyncio.Event()
-        
+        self.mixer_initialized = False
+
     async def init_playback(self):
         """Initialize audio playback"""
-        pygame.mixer.init()
-        
+        try:
+            pygame.mixer.init()
+            self.mixer_initialized = True
+        except Exception as e:
+            logging.error(f"Error initializing audio mixer: {e}")
+            self.mixer_initialized = False
+
     async def play_audio(self, audio_path: Path) -> bool:
         """Play audio file"""
+        if not self.mixer_initialized:
+            logging.error("Audio mixer not initialized")
+            return False
+
         try:
             self.is_speaking.set()
             pygame.mixer.music.load(str(audio_path))
             pygame.mixer.music.play()
-            
+
             while pygame.mixer.music.get_busy():
                 await asyncio.sleep(0.1)
             return True
-            
+
         except Exception as e:
             logging.error(f"Error playing audio: {e}")
             return False
         finally:
             self.is_speaking.clear()
             pygame.mixer.music.unload()
-            
+
     def get_input_stream(self, sample_rate: int, channels: int, frames_per_buffer: int) -> Optional[pyaudio.Stream]:
         """Get audio input stream"""
         try:
@@ -49,7 +59,7 @@ class AudioManager:
         except Exception as e:
             logging.error(f"Error creating input stream: {e}")
             return None
-            
+
     async def cleanup(self):
         """Cleanup audio resources"""
         if self.stream:
@@ -57,4 +67,5 @@ class AudioManager:
             self.stream.close()
         if self.pa:
             self.pa.terminate()
-        pygame.mixer.quit()
+        if self.mixer_initialized:
+            pygame.mixer.quit()

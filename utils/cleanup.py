@@ -1,5 +1,5 @@
 # utils/cleanup.py
-import logging
+from utils import logging
 from pathlib import Path
 import time
 from config.settings import settings

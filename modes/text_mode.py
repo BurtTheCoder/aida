@@ -14,9 +14,18 @@ class TextMode:
         self.audio_manager = AudioManager() if use_tts else None
         self.shutdown_event = asyncio.Event()
 
+    async def initialize(self):
+        """Initialize audio system if TTS is enabled"""
+        if self.use_tts and self.audio_manager:
+            await self.audio_manager.init_playback()
+
     async def run(self):
         """Run text mode"""
         try:
+            # Initialize audio if TTS is enabled
+            if self.use_tts:
+                await self.initialize()
+
             print("\nAida: Hello! How can I help you?")
             print("Commands: 'exit' or 'quit' to exit, 'help' for help")
             print("------------------------------------------\n")
@@ -25,6 +34,12 @@ class TextMode:
                 try:
                     user_input = input("You: ").strip()
                     if not user_input:
+                        continue
+
+                    if user_input.lower() == 'memory':
+                        context = await self.assistant.get_user_context()
+                        print("\nMemory Context:")
+                        print(context)
                         continue
 
                     if user_input.lower() in ['exit', 'quit']:
@@ -60,6 +75,9 @@ class TextMode:
     async def speak(self, text: str):
         """Convert text to speech and play it"""
         try:
+            if not self.use_tts or not self.tts_service or not self.audio_manager:
+                return
+
             output_path = settings.AUDIO_DIR / "response.mp3"
             if await self.tts_service.generate_speech(text, output_path):
                 await self.audio_manager.play_audio(output_path)
