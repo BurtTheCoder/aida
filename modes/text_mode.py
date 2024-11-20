@@ -36,12 +36,6 @@ class TextMode:
                     if not user_input:
                         continue
 
-                    if user_input.lower() == 'memory':
-                        context = await self.assistant.get_user_context()
-                        print("\nMemory Context:")
-                        print(context)
-                        continue
-
                     if user_input.lower() in ['exit', 'quit']:
                         break
 

@@ -1,30 +1,9 @@
 # utils/logging.py
-import logging
-
-# Configure logger
-logger = logging.getLogger('aida')
+from .logger import debug, info, warning, error, critical, set_debug_mode as _set_debug_mode
 
 def setup_logging(debug: bool = False):
-    """Configure logging"""
-    level = logging.DEBUG if debug else logging.INFO
+    """Configure logging level"""
+    _set_debug_mode(debug)
 
-    # Create formatter
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-    # Create console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-
-    # Configure logger
-    logger.setLevel(level)
-    logger.addHandler(console_handler)
-
-    # Clear any existing handlers to prevent duplicate logs
-    logger.handlers = [console_handler]
-
-# Export logger functions for convenience
-debug = logger.debug
-info = logger.info
-warning = logger.warning
-error = logger.error
-critical = logger.critical
+# Export for compatibility
+__all__ = ['debug', 'info', 'warning', 'error', 'critical', 'setup_logging']

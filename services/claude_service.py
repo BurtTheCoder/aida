@@ -42,8 +42,58 @@ class ClaudeService:
                     }
                 },
                 "required": ["query"]
+            },
+        },
+        {
+                "name": "search_memories",
+                "description": """
+                Search through the user's memory for relevant past interactions and information.
+
+                Use this tool when you need to:
+                - Recall specific past conversations
+                - Check user preferences or information previously shared
+                - Maintain consistency with past interactions
+                - Reference historical context
+
+                The tool returns relevant memories in chronological order.
+                """,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query to find relevant memories"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of memories to return",
+                            "default": 5
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "get_context",
+                "description": """
+                Retrieve user context from memory to understand preferences and history.
+
+                Use this tool when you need to:
+                - Get overall context about the user
+                - Understand user preferences
+                - Check important historical information
+                """,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {
+                            "type": "string",
+                            "description": "ID of the user to get context for"
+                        }
+                    }
+                }
             }
-        }]
+        ]
 
     async def _make_request_with_retry(self, func, *args, max_retries=3, **kwargs):
         """Helper method to make requests with retry logic"""
@@ -63,7 +113,7 @@ class ClaudeService:
                 logging.error(f"Unexpected error in Claude request: {str(e)}")
                 raise
 
-    async def handle_message_with_tools(self, message: str, web_search_service: Any) -> str:
+    async def handle_message_with_tools(self, message: str, web_search_service: Any, memory_tools: Any, user_id: str) -> str:
         """Process user input using Claude with tool use capabilities"""
         try:
             # Initial response from Claude
@@ -90,12 +140,17 @@ class ClaudeService:
                     tool_call = tool_calls[0]  # Get the first tool call
                     logging.info(f"Tool Response Request: {tool_calls}")
 
+                    tool_result = None
                     if tool_call.name == "web_search":
                         search_query = tool_call.input["query"]
-                        logging.info(f"Web search query: {search_query}")
                         tool_result = await web_search_service.search(search_query)
-                        logging.info(f"Web search result: {tool_result}")
+                    elif tool_call.name == "search_memories":
+                        query = tool_call.input["query"]
+                        tool_result = await memory_tools.search_memories(query, user_id)
+                    elif tool_call.name == "get_context":
+                        tool_result = await memory_tools.get_context(user_id)
 
+                    if tool_result:
                         tool_result_content = {
                             "role": "user",
                             "content": [

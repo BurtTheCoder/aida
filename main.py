@@ -35,8 +35,25 @@ def setup_args():
     )
     return parser.parse_args()
 
+async def shutdown(mode, assistant):
+    """Graceful shutdown procedure"""
+    logging.info("Starting graceful shutdown...")
+    try:
+        # Cleanup mode-specific resources
+        if mode:
+            await mode.cleanup()
+        # Cleanup assistant resources
+        if assistant:
+            await assistant.cleanup()
+        logging.info("Cleanup completed successfully")
+    except Exception as e:
+        logging.error(f"Error during cleanup: {e}", exc_info=True)
+
 async def main():
     """Main program entry point"""
+    mode = None
+    assistant = None
+
     try:
         args = setup_args()
         setup_logging(debug=args.debug)
@@ -57,7 +74,7 @@ async def main():
         except Exception as e:
             logging.error(f"Unexpected error in main loop: {e}", exc_info=True)
         finally:
-            await mode.cleanup()
+            await shutdown(mode, assistant)
 
     except Exception as e:
         logging.error(f"Critical error during startup: {e}", exc_info=True)
