@@ -1,0 +1,11 @@
+elevenlabs
+deepgram-sdk
+langchain
+pygame
+pyaudio
+python-dotenv
+scipy
+ffmpeg-python
+pvporcupine
+websocket-client
+anthropic
