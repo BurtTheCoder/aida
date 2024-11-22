@@ -1,5 +1,4 @@
 # services/memory_service.py
-import os
 from mem0 import Memory
 import asyncio
 from typing import List, Dict, Any, Optional
@@ -9,9 +8,21 @@ from datetime import datetime, timedelta
 import uuid
 from pathlib import Path
 from storage.qdrant_manager import QdrantManager
+from cachetools import TTLCache
+import time
 
 class Mem0Service:
     def __init__(self):
+        # Initialize caches
+        self._memory_cache = TTLCache(maxsize=100, ttl=300)  # 5 minute TTL
+        self._context_cache = TTLCache(maxsize=50, ttl=600)  # 10 minute TTL
+
+        # Initialize batch processing
+        self._batch_queue = []
+        self._batch_size = 5
+        self._last_batch_time = time.time()
+        self._batch_lock = asyncio.Lock()
+
         # Initialize Qdrant manager
         self.qdrant_manager = QdrantManager()
 
@@ -19,7 +30,7 @@ class Mem0Service:
         if not self.qdrant_manager.health_check():
             raise RuntimeError("Qdrant is not available")
 
-        # Configure mem0 with supported settings only
+        # Configure mem0
         self.config = {
             "vector_store": {
                 "provider": "qdrant",
@@ -59,63 +70,178 @@ class Mem0Service:
             logging.info("Mem0 service initialized successfully")
 
             # Check collection statistics and optimize if needed
-            try:
-                collection_stats = self.qdrant_manager.get_collection_stats()
-                vectors_count = collection_stats.get("vectors_count")
-
-                if vectors_count is not None and vectors_count > 10000:
-                    self.qdrant_manager.optimize_collection()
-                    logging.info("Collection optimization triggered")
-            except Exception as e:
-                logging.warning(f"Could not check collection statistics: {e}")
-
+            self._check_and_optimize_collection()
         except Exception as e:
             logging.error(f"Error initializing mem0: {e}")
             raise
 
-    async def store_interaction(self, user_input: str, assistant_response: str, user_id: str = "default_user"):
-        """Store an interaction in memory with enhanced metadata"""
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.cleanup()
+
+    async def cleanup(self):
+        """Cleanup resources"""
         try:
-            if not user_input or not assistant_response:
-                return
+            # Process any remaining batch items
+            if self._batch_queue:
+                await self._process_batch()
 
-            current_time = datetime.now().isoformat()
-            conversation_id = str(uuid.uuid4())
+            # Clear caches
+            self._memory_cache.clear()
+            self._context_cache.clear()
 
-            # Create the interaction payload
-            interaction = {
-                "user_message": user_input.strip(),
-                "assistant_response": assistant_response.strip(),
-                "timestamp": current_time
-            }
+            logging.info("Memory service cleanup completed")
+        except Exception as e:
+            logging.error(f"Error during memory service cleanup: {e}")
 
-            # Create metadata
-            metadata = {
-                "type": "conversation",
-                "app": "aida",
-                "timestamp": current_time,
-                "message_type": "interaction",
-                "conversation_id": conversation_id,
-                "user_id": user_id
-            }
+    def _check_and_optimize_collection(self):
+        """Check collection statistics and optimize if needed"""
+        try:
+            collection_stats = self.qdrant_manager.get_collection_stats()
+            vectors_count = collection_stats.get("vectors_count")
 
-            # Store in background
-            def _store():
+            if vectors_count is not None and vectors_count > 10000:
+                self.qdrant_manager.optimize_collection()
+                logging.info("Collection optimization triggered")
+        except Exception as e:
+            logging.warning(f"Could not check collection statistics: {e}")
+
+    def _monitor_cache_sizes(self):
+        """Monitor cache sizes for debugging"""
+        logging.debug(
+            f"Cache sizes - Memory: {len(self._memory_cache)}, "
+            f"Context: {len(self._context_cache)}"
+        )
+
+    async def store_interaction(self, user_input: str, response: str, user_id: str):
+        """Queue interaction for batch storage"""
+        async with self._batch_lock:
+            store_start = time.time()
+
+            self._batch_queue.append({
+                'user_input': user_input,
+                'response': response,
+                'user_id': user_id,
+                'timestamp': datetime.now().isoformat()
+            })
+
+            logging.debug(f"Queued interaction for storage in: {time.time() - store_start:.2f}s")
+
+            # Process batch if size threshold reached or time threshold exceeded
+            if len(self._batch_queue) >= self._batch_size or \
+               time.time() - self._last_batch_time > 30:  # Force batch after 30 seconds
+                await self._process_batch()
+
+    async def _process_batch(self):
+        """Process queued interactions in batch"""
+        if not self._batch_queue:
+            return
+
+        try:
+            batch_start = time.time()
+            batch = self._batch_queue.copy()
+            self._batch_queue.clear()
+            self._last_batch_time = time.time()
+
+            # Group batch items by user_id for more efficient processing
+            user_batches: Dict[str, List[Dict]] = {}
+            for item in batch:
+                user_id = item['user_id']
+                if user_id not in user_batches:
+                    user_batches[user_id] = []
+                user_batches[user_id].append(item)
+
+            # Process each user's batch in parallel with timeout
+            tasks = []
+            for user_id, user_items in user_batches.items():
+                tasks.extend([
+                    self._store_single_interaction(item)
+                    for item in user_items
+                ])
+
+            # Use wait_for instead of timeout context
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=30.0)
+
+            logging.debug(
+                f"Processed batch of {len(batch)} items "
+                f"for {len(user_batches)} users in: {time.time() - batch_start:.2f}s"
+            )
+
+        except asyncio.TimeoutError:
+            logging.error("Batch processing timed out")
+            self._batch_queue.extend(batch)  # Restore batch for retry
+        except Exception as e:
+            logging.error(f"Batch processing error: {e}")
+            self._batch_queue.extend(batch)
+
+    async def _store_single_interaction(self, item: Dict[str, Any]):
+        """Store a single interaction in memory"""
+        try:
+            # Add retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
                 try:
-                    self.memory.add(
-                        json.dumps(interaction),
-                        user_id=user_id,
-                        metadata=metadata
-                    )
-                    logging.info(f"Successfully stored interaction for user {user_id}")
-                except Exception as e:
-                    logging.error(f"Error storing in memory: {str(e)}")
+                    interaction = {
+                        "user_message": item['user_input'].strip(),
+                        "assistant_response": item['response'].strip(),
+                        "timestamp": item['timestamp']
+                    }
 
-            # Run storage operation in thread pool
-            await asyncio.get_event_loop().run_in_executor(None, _store)
+                    metadata = {
+                        "type": "conversation",
+                        "app": "aida",
+                        "timestamp": item['timestamp'],
+                        "message_type": "interaction",
+                        "conversation_id": str(uuid.uuid4()),
+                        "user_id": item['user_id']
+                    }
+
+                    # Use wait_for instead of timeout context
+                    await asyncio.wait_for(
+                        self._do_store(interaction, metadata, item['user_id']),
+                        timeout=5.0
+                    )
+
+                    # Invalidate relevant caches
+                    self._invalidate_caches(item['user_id'])
+
+                    logging.info(f"Successfully stored interaction for user {item['user_id']}")
+                    return
+
+                except asyncio.TimeoutError:
+                    if attempt == max_retries - 1:
+                        raise
+                    logging.warning(f"Timeout on attempt {attempt + 1}/{max_retries} for storing interaction")
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    logging.warning(f"Retry {attempt + 1}/{max_retries} for storing interaction: {e}")
+                    await asyncio.sleep(1)
 
         except Exception as e:
-            logging.error(f"Error preparing memory storage: {str(e)}")
+            logging.error(f"Error storing single interaction: {e}")
+            raise
+
+    async def _do_store(self, interaction: Dict, metadata: Dict, user_id: str):
+        """Actual storage operation"""
+        self.memory.add(
+            json.dumps(interaction),
+            user_id=user_id,
+            metadata=metadata
+        )
+
+    def _invalidate_caches(self, user_id: str):
+        """Invalidate caches for a user"""
+        # Remove all cached items for this user
+        keys_to_remove = [k for k in self._memory_cache.keys() if k.startswith(f"{user_id}:")]
+        for k in keys_to_remove:
+            self._memory_cache.pop(k, None)
+
+        # Remove context cache
+        self._context_cache.pop(user_id, None)
 
     async def get_relevant_memories(
         self,
@@ -123,95 +249,83 @@ class Mem0Service:
         user_id: str = "default_user",
         limit: int = 5,
     ) -> List[Dict[str, Any]]:
-        """Retrieve relevant memories combining recent and semantically relevant results"""
+        """Retrieve relevant memories with caching and optimization"""
+        cache_key = f"{user_id}:{query}"
+
+        # Check cache first
+        if cache_key in self._memory_cache:
+            logging.debug("Returning cached memories")
+            return self._memory_cache[cache_key]
+
         try:
-            # Get recent memories
-            recent_memories = self.memory.get_all(
-                user_id=user_id,
-                limit=3,
-            )
+            # Use generator for memory efficient processing
+            async def memory_generator():
+                # Get recent memories
+                for memory in self.memory.get_all(user_id=user_id, limit=3):
+                    yield memory
 
-            # Get semantically relevant memories
-            relevant_memories = self.memory.search(
-                query,
-                user_id=user_id,
-                limit=limit
-            )
+                # Get semantically relevant memories
+                for memory in self.memory.search(query, user_id=user_id, limit=limit):
+                    yield memory
 
-            # Process and merge memories
+            # Process memories efficiently
             processed_memories = []
-
-            # Process recent memories
-            for memory in recent_memories:
-                processed = await self._process_memory_result(memory)
-                if processed:
-                    processed_memories.append(processed)
-
-            # Process relevant memories
-            for memory in relevant_memories:
-                processed = await self._process_memory_result(memory)
-                if processed:
-                    processed_memories.append(processed)
-
-            # Remove duplicates and sort by timestamp
             seen = set()
-            unique_memories = []
-            for memory in processed_memories:
-                memory_id = f"{memory['timestamp']}_{memory['text']}"
-                if memory_id not in seen:
-                    seen.add(memory_id)
-                    unique_memories.append(memory)
+            async for memory in memory_generator():
+                processed = await self._process_memory_result(memory)
+                if processed:
+                    memory_id = f"{processed['timestamp']}_{processed['text']}"
+                    if memory_id not in seen:
+                        seen.add(memory_id)
+                        processed_memories.append(processed)
+
+                        # Early exit if we have enough memories
+                        if len(processed_memories) >= limit:
+                            break
 
             # Sort by timestamp
             sorted_memories = sorted(
-                unique_memories,
+                processed_memories,
                 key=lambda x: x['timestamp'],
                 reverse=True
-            )
+            )[:limit]
 
-            return sorted_memories[:limit]
+            # Cache the results
+            self._memory_cache[cache_key] = sorted_memories
+            return sorted_memories
 
         except Exception as e:
             logging.error(f"Error retrieving memories: {str(e)}")
             return []
 
-    def _merge_memories(self, recent: List[Any], relevant: List[Any]) -> List[Any]:
-        """Merge and deduplicate memories while preserving order"""
+    async def get_user_context(self, user_id: str = "default_user", limit: int = 10) -> List[Dict[str, Any]]:
+        """Get user context with caching"""
+        if user_id in self._context_cache:
+            return self._context_cache[user_id]
+
         try:
-            seen = set()
-            merged = []
+            memories = self.memory.get_all(
+                user_id=user_id,
+                limit=limit
+            )
 
-            for memory in recent + relevant:
-                try:
-                    memory_id = getattr(memory, 'id', str(memory))
-                    if memory_id not in seen:
-                        seen.add(memory_id)
-                        merged.append(memory)
-                except Exception as e:
-                    logging.error(f"Error processing memory in merge: {str(e)}")
-                    continue
+            # Sort memories by timestamp
+            memories = sorted(
+                memories,
+                key=lambda x: getattr(x, 'metadata', {}).get('timestamp', ''),
+                reverse=True
+            )
 
-            return merged
+            formatted_memories = self._format_memories(memories)
+            self._context_cache[user_id] = formatted_memories
+            return formatted_memories
+
         except Exception as e:
-            logging.error(f"Error merging memories: {str(e)}")
+            logging.error(f"Error getting user context: {str(e)}")
             return []
 
-    def _format_memories(self, memories: List[Any]) -> List[Dict[str, Any]]:
-        """Format memories for use with safe processing"""
-        formatted_memories = []
-        for memory in memories:
-            try:
-                processed_memory = self._process_memory_result(memory)
-                if processed_memory:
-                    formatted_memories.append(processed_memory)
-            except Exception as e:
-                logging.error(f"Error formatting memory: {str(e)}")
-                continue
-
-        return formatted_memories
-
-    async def _process_memory_result(self, memory_obj: Any) -> Dict[str, Any]:
-        """Safely process memory objects"""
+    async def _process_memory_result(self, memory_obj: Any) -> Optional[Dict[str, Any]]:
+        """Process memory objects safely"""
         try:
             if hasattr(memory_obj, 'payload'):
                 # Try to parse JSON payload
@@ -243,27 +357,18 @@ class Mem0Service:
             logging.error(f"Error processing memory result: {str(e)}")
             return None
 
-    async def get_user_context(self, user_id: str = "default_user", limit: int = 10) -> List[Dict[str, Any]]:
-        """Get all memories for a user with enhanced formatting"""
-        try:
-            # Get all memories without sorting parameters
-            memories = self.memory.get_all(
-                user_id=user_id,
-                limit=limit
-            )
-
-            # Sort memories by timestamp manually
-            memories = sorted(
-                memories,
-                key=lambda x: getattr(x, 'metadata', {}).get('timestamp', ''),
-                reverse=True
-            )
-
-            return self._format_memories(memories)
-
-        except Exception as e:
-            logging.error(f"Error getting user context: {str(e)}")
-            return []
+    def _format_memories(self, memories: List[Any]) -> List[Dict[str, Any]]:
+        """Format memories for use"""
+        formatted_memories = []
+        for memory in memories:
+            try:
+                processed_memory = self._process_memory_result(memory)
+                if processed_memory:
+                    formatted_memories.append(processed_memory)
+            except Exception as e:
+                logging.error(f"Error formatting memory: {str(e)}")
+                continue
+        return formatted_memories
 
     async def prune_old_memories(self, user_id: str, days_old: int = 30):
         """Remove memories older than specified days"""
@@ -312,6 +417,8 @@ class Mem0Service:
         """Clear all memories for a user"""
         try:
             self.memory.delete_all(user_id=user_id)
+            # Clear all caches for this user
+            self._invalidate_caches(user_id)
             logging.info(f"Cleared all memories for user {user_id}")
         except Exception as e:
             logging.error(f"Error clearing memories: {str(e)}")

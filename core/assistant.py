@@ -8,54 +8,92 @@ from utils import logging
 from typing import List, Dict, Any, Set
 from datetime import datetime
 import asyncio
+import time
 
 class AidaAssistant:
     def __init__(self, user_id: str = "default_user"):
         self.claude_service = ClaudeService()
         self.web_search = WebSearchService()
         self.memory = Mem0Service()
-        self.conversation_cache = ConversationCache(max_size=10)
+        self.conversation_cache = ConversationCache(max_size=5)  # Reduced from 10
         self.memory_tools = MemoryTools(self.memory)
         self.user_id = user_id
         self.background_tasks: Set[asyncio.Task] = set()
+        self.processing_complete = asyncio.Event()
 
     async def process_input(self, user_input: str) -> str:
-        """Process user input with recent context"""
+        start_time = time.time()
+        self.processing_complete.clear()
+
         try:
-            # Get recent conversation context
-            recent_context = await self.conversation_cache.get_recent_context(self.user_id)
+            logging.debug("Starting input processing")
+
+            # Get context with timeout
+            try:
+                context_task = asyncio.create_task(
+                    self.conversation_cache.get_recent_context(self.user_id)
+                )
+                recent_context = await asyncio.wait_for(context_task, timeout=3.0)
+            except asyncio.TimeoutError:
+                logging.warning("Context retrieval timed out, proceeding without context")
+                recent_context = ""
+
+            logging.debug(f"Memory retrieval took: {time.time() - start_time:.2f}s")
 
             # Create contextualized input
-            contextualized_input = ""
-            if recent_context:
-                contextualized_input = (
-                    "Recent conversation context:\n"
-                    f"{recent_context}\n\n"
-                    f"Current input: {user_input}"
+            claude_start_time = time.time()
+            contextualized_input = (
+                f"Recent conversation context:\n{recent_context}\n\n"
+                f"Current input: {user_input}"
+            ) if recent_context else user_input
+
+            # Process with Claude (with increased timeout)
+            try:
+                response_task = asyncio.create_task(
+                    self.claude_service.handle_message_with_tools(
+                        contextualized_input,
+                        self.web_search,
+                        self.memory_tools,
+                        self.user_id
+                    )
                 )
-            else:
-                contextualized_input = user_input
+                response = await asyncio.wait_for(response_task, timeout=60.0)  # Increased from 10s to 20s
+            except asyncio.TimeoutError:
+                logging.warning("Claude processing timed out")
+                return "I apologize, but I'm taking longer than expected to process your request. Would you like me to try again with a simpler query?"
 
-            # Process with Claude
-            response = await self.claude_service.handle_message_with_tools(
-                contextualized_input,
-                self.web_search,
-                self.memory_tools,
-                self.user_id
-            )
+            logging.debug(f"Claude processing took: {time.time() - claude_start_time:.2f}s")
 
-            # Store interaction in background
-            self._store_interaction_background(user_input, response)
+            # Verify response isn't empty
+            if not response or not response.strip():
+                logging.error("Empty response received from Claude")
+                return "I apologize, but I received an empty response. Please try again."
 
+            # Store interaction in background with verification
+            store_start_time = time.time()
+            store_task = asyncio.create_task(self._store_interaction_background(user_input, response))
+            try:
+                await asyncio.wait_for(store_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                logging.warning("Storage operation timed out, continuing with response")
+
+            logging.debug(f"Background storage initiated: {time.time() - store_start_time:.2f}s")
+
+            total_time = time.time() - start_time
+            logging.debug(f"Total processing time: {total_time:.2f}s")
+
+            self.processing_complete.set()
             return response
 
         except Exception as e:
+            self.processing_complete.set()
             logging.error(f"Error processing input: {e}", exc_info=True)
-            return "I apologize, but I encountered an error processing your request."
+            return "I apologize, but I encountered an error processing your request. Please try again."
 
-    def _store_interaction_background(self, user_input: str, response: str):
+    async def _store_interaction_background(self, user_input: str, response: str):
         """Store interaction in background without blocking"""
         async def _store():
+            store_start = time.time()
             try:
                 # Store in cache and memory concurrently
                 await asyncio.gather(
@@ -70,6 +108,7 @@ class AidaAssistant:
                         self.user_id
                     )
                 )
+                logging.debug(f"Background storage completed in: {time.time() - store_start:.2f}s")
             except Exception as e:
                 logging.error(f"Background storage error: {e}")
 

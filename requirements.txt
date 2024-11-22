@@ -9,3 +9,7 @@ ffmpeg-python
 pvporcupine
 websocket-client
 anthropic
+cachetools
+verboselogs
+asyncio
+aiofiles

@@ -8,20 +8,35 @@ from utils import logging
 class WakeWordDetector:
     def __init__(self):
         self.porcupine = None
-        
+
     def initialize(self) -> bool:
         """Initialize wake word detector"""
         try:
+            logging.debug("Testing Picovoice API key...")
+            if not settings.PICOVOICE_API_KEY:
+                logging.error("Picovoice API key not found")
+                return False
+
+            # Test key validity
+            test_result = pvporcupine.create(
+                access_key=settings.PICOVOICE_API_KEY,
+                keywords=["jarvis"]
+            )
+            test_result.delete()
+
+            # If we get here, key is valid
+            logging.debug("Picovoice API key is valid")
+
             self.porcupine = pvporcupine.create(
                 access_key=settings.PICOVOICE_API_KEY,
                 keywords=["jarvis"],
-                sensitivities=[0.5]
+                sensitivities=[1.0]  # Maximum sensitivity
             )
             return True
         except Exception as e:
             logging.error(f"Wake word initialization error: {e}")
             return False
-            
+
     def process_audio(self, audio_frame: bytes) -> bool:
         """Process audio frame for wake word detection"""
         try:
@@ -31,7 +46,7 @@ class WakeWordDetector:
         except Exception as e:
             logging.error(f"Wake word processing error: {e}")
             return False
-            
+
     def cleanup(self):
         """Cleanup wake word detector"""
         if self.porcupine:
