@@ -1,6 +1,6 @@
 # services/conversation_cache.py
 from collections import deque
-from typing import Dict, List, Optional
+from typing import Optional
 from datetime import datetime
 import asyncio
 

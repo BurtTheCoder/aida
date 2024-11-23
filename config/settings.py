@@ -2,7 +2,6 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Optional
 
 class Settings:
     def __init__(self):
@@ -19,7 +18,7 @@ class Settings:
 
         # API Keys
         self.ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-        self.DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+        self.DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
         self.PICOVOICE_API_KEY = os.getenv("PICOVOICE_API_KEY")
         self.ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
         self.PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
@@ -53,6 +52,5 @@ class Settings:
 
     @property
     def websocket_url(self) -> str:
-        return "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&interim_results=true&utterance_end_ms=1000"
-
+        return "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&interim_results=true&endpointing=true"
 settings = Settings()
